@@ -13,6 +13,7 @@ import ffmpeg
 import insightface
 import numpy as np
 import onnxruntime
+from insightface.app.common import Face
 from insightface.model_zoo.inswapper import INSwapper
 
 from krzys import core
@@ -59,31 +60,53 @@ def is_video(url: str) -> bool:
     return not is_image(url)
 
 
-def process_image(source: bytes, target: bytes) -> bytes:
+def bytes_to_cv2(image_bytes: bytes) -> cv2.typing.MatLike:
+    return cv2.imdecode(np.asarray(bytearray(image_bytes), dtype=np.uint8), cv2.IMREAD_COLOR)
+
+
+def cv2_get_all_faces(image_cv2: cv2.typing.MatLike) -> list[Face]:
+    faces = face_analyzer.get(image_cv2)
+    if not faces or len(faces) == 0:
+        return []
+
+    return faces
+
+
+def get_all_faces(image: bytes) -> list[Face]:
+    image_cv2 = cv2.imdecode(np.asarray(bytearray(image), dtype=np.uint8), cv2.IMREAD_COLOR)
+    faces = face_analyzer.get(image_cv2)
+    if not faces or len(faces) == 0:
+        return []
+
+    return faces
+
+
+def get_one_face(image: bytes) -> Face | None:
+    faces = get_all_faces(image)
+    if len(faces) < 1:
+        return None
+
+    return faces[0]
+
+
+def process_image(source_face: Face, target: bytes) -> bytes:
     """
-    :raises SourceFileDoesNotContainFaceError:
     :raises TargetImageDoesNotContainFaceError:
 
-    :param source: bytes
+    :param source_face: Face
     :param target: bytes
     :return: bytes
     """
-    source_image = cv2.imdecode(np.asarray(bytearray(source), dtype=np.uint8), cv2.IMREAD_COLOR)
-    source_faces = face_analyzer.get(source_image)
-    if not source_faces or len(source_faces) == 0:
-        raise SourceFileDoesNotContainFaceError()
+    cv2_target = bytes_to_cv2(target)
+    target_faces = cv2_get_all_faces(cv2_target)
 
-    source_face = source_faces[0]
-
-    target_image = cv2.imdecode(np.asarray(bytearray(target), dtype=np.uint8), cv2.IMREAD_COLOR)
-    target_faces = face_analyzer.get(target_image)
-    if not target_faces or len(target_faces) == 0:
+    if len(target_faces) < 1:
         raise TargetImageDoesNotContainFaceError()
 
     for target_face in target_faces:
-        target_image = face_swapper.get(target_image, target_face, source_face, paste_back=True)
+        cv2_target = face_swapper.get(cv2_target, target_face, source_face, paste_back=True)
 
-    return cv2.imencode('.jpg', target_image)[1].tobytes()
+    return cv2.imencode('.jpg', cv2_target)[1].tobytes()
 
 
 def split_video(source: bytes, session_name: str, fps: int = 24) -> int:
@@ -160,9 +183,16 @@ def join_video(session_name: str, fps: int = 24) -> bytes:
     out_file = core.config.get_tmp_file(session_name, 'output.mp4')
 
     video = ffmpeg.input(frames, framerate=fps, start_number=0).video
-    audio = ffmpeg.input(in_file).audio
-    ffmpeg.output(video, audio, out_file, shortest=None).run(quiet=True)
-
+    try:
+        audio = ffmpeg.input(in_file).audio
+        if audio is not None:
+            ffmpeg.output(video, audio, out_file, shortest=None, vf='pad=\'width=ceil(iw/2)*2:height=ceil(ih/2)*2\'').run(quiet=True)
+        else:
+            ffmpeg.output(video, out_file, vf='pad="width=ceil(iw/2)*2:height=ceil(ih/2)*2"').run(quiet=True)
+    except Exception:
+        if os.path.exists(out_file):
+            os.remove(out_file)
+        ffmpeg.output(video, out_file, vf='pad="width=ceil(iw/2)*2:height=ceil(ih/2)*2"').run(quiet=True)
 
     result_bytes: bytes
     with open(out_file, 'rb') as f:
@@ -207,6 +237,7 @@ async def process_video_multithreaded2(i: discord.Interaction, source: bytes, ta
     start_time = time.time()
 
     await i.edit_original_response(content="Przetwarzam klatki...")
+    processed_frames = 0
     with ThreadPoolExecutor(max_workers=threads) as executor:
         futures = []
         queue: Queue[int] = Queue()
@@ -222,6 +253,10 @@ async def process_video_multithreaded2(i: discord.Interaction, source: bytes, ta
 
         for future in as_completed(futures):
             future.result()
+            processed_frames += 1
+            if processed_frames % 20 == 0:
+                await i.edit_original_response(
+                    content="Przetworzono %d/%d klatek" % (processed_frames, frame_count))
 
     end_time = time.time()
     print("Time taken: ", end_time - start_time)
